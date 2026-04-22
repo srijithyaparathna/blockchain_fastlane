@@ -13,6 +13,7 @@ publish = false
 targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
+pallet-fastlane = { path = "../pallets/fastlane", default-features = false }
 codec = { features = ["derive"], workspace = true }
 frame-benchmarking = { optional = true, workspace = true }
 frame-executive.workspace = true
@@ -87,6 +88,9 @@ std = [
 	"sp-transaction-pool/std",
 	"sp-version/std",
 	"substrate-wasm-builder",
+
+	 
+    "pallet-fastlane/std", 
 ]
 
 runtime-benchmarks = [

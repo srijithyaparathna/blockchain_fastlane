@@ -8,6 +8,9 @@ pub mod apis;
 mod benchmarks;
 pub mod configs;
 
+ // fastlane pallet
+pub use pallet_fastlane;
+
 extern crate alloc;
 use alloc::vec::Vec;
 use sp_runtime::{
@@ -183,6 +186,20 @@ pub type Executive = frame_executive::Executive<
 	Migrations,
 >;
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // Create the runtime by composing the FRAME pallets that were previously configured.
 #[frame_support::runtime]
 mod runtime {
@@ -222,7 +239,10 @@ mod runtime {
 	#[runtime::pallet_index(6)]
 	pub type Sudo = pallet_sudo;
 
-	// Include the custom logic from the pallet-template in the runtime.
 	#[runtime::pallet_index(7)]
 	pub type Template = pallet_template;
+
+	// ✅ FIXED NAME (important)
+	#[runtime::pallet_index(8)]
+	pub type Fastlane = pallet_fastlane;
 }

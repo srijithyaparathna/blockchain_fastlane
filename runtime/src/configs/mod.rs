@@ -58,6 +58,9 @@ parameter_types! {
 	);
 	pub RuntimeBlockLength: BlockLength = BlockLength::max_with_normal_ratio(5 * 1024 * 1024, NORMAL_DISPATCH_RATIO);
 	pub const SS58Prefix: u8 = 42;
+
+	 // ADD THIS LINE ↓
+    pub const MaxAuthorities: u32 = 50;
 }
 
 /// The default types are being injected by [`derive_impl`](`frame_support::derive_impl`) from
@@ -161,4 +164,20 @@ impl pallet_sudo::Config for Runtime {
 impl pallet_template::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type WeightInfo = pallet_template::weights::SubstrateWeight<Runtime>;
+}
+impl pallet_fastlane::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type Currency = Balances;
+
+    type MinAuthorityBond = ConstU128<1_000>;
+    type MaxPendingPayloads = ConstU32<100>;
+    type MaxAuthorities = MaxAuthorities;
+
+    // ✅ FIXED
+    type AuthorityId = pallet_fastlane::crypto::FastlaneAuthId;
+
+    // ✅ FIXED
+    type AllowedDomains = AllowedDomains;
+
+    type OnFinalised = ();
 }
