@@ -187,20 +187,67 @@ pub type Executive = frame_executive::Executive<
 >;
 
 
+use codec::Encode;
+use sp_runtime::traits::StaticLookup;
+use frame_system::offchain::{AppCrypto, CreateSignedTransaction};
 
 
 
 
-
-
-
-
-
-
-
-
+impl frame_system::offchain::SigningTypes for Runtime {
+    type Public = <Signature as sp_runtime::traits::Verify>::Signer;
+    type Signature = Signature;
+}
 
 // Create the runtime by composing the FRAME pallets that were previously configured.
+
+impl frame_system::offchain::CreateTransactionBase<pallet_fastlane::Call<Runtime>>
+    for Runtime
+{
+    type Extrinsic = UncheckedExtrinsic;
+    type RuntimeCall = RuntimeCall;
+}
+
+impl CreateSignedTransaction<pallet_fastlane::Call<Runtime>> for Runtime {
+    fn create_signed_transaction<C: AppCrypto<Self::Public, Self::Signature>>(
+        call: RuntimeCall,
+        public: Self::Public,
+        account: AccountId,
+        nonce: Nonce,
+    ) -> Option<UncheckedExtrinsic> {
+        use sp_runtime::{generic::Era, SaturatedConversion};
+
+        let tip = 0;
+        let period = configs::BlockHashCount::get()
+            .checked_next_power_of_two()
+            .map(|c| c / 2)
+            .unwrap_or(2) as u64;
+        let current_block = System::block_number()
+            .saturated_into::<u64>()
+            .saturating_sub(1);
+        let era = Era::mortal(period, current_block);
+
+        let tx_ext: TxExtension = (
+            frame_system::CheckNonZeroSender::<Runtime>::new(),
+            frame_system::CheckSpecVersion::<Runtime>::new(),
+            frame_system::CheckTxVersion::<Runtime>::new(),
+            frame_system::CheckGenesis::<Runtime>::new(),
+            frame_system::CheckEra::<Runtime>::from(era),
+            frame_system::CheckNonce::<Runtime>::from(nonce),
+            frame_system::CheckWeight::<Runtime>::new(),
+            pallet_transaction_payment::ChargeTransactionPayment::<Runtime>::from(tip),
+            frame_metadata_hash_extension::CheckMetadataHash::<Runtime>::new(false),
+            frame_system::WeightReclaim::<Runtime>::new(),
+        );
+
+        let raw_payload = SignedPayload::new(call, tx_ext).ok()?;
+        let signature = raw_payload.using_encoded(|payload| C::sign(payload, public))?;
+        let address = <Runtime as frame_system::Config>::Lookup::unlookup(account);
+        let (call, tx_ext, _) = raw_payload.deconstruct();
+        Some(UncheckedExtrinsic::new_signed(call, address, signature, tx_ext))
+    }
+}
+
 #[frame_support::runtime]
 mod runtime {
 	#[runtime::runtime]

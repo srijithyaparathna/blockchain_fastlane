@@ -57,30 +57,9 @@ pub mod pallet {
     use sp_std::vec::Vec;
 
     // --------------------------------------------------------
-    // OCW crypto key type
-    // --------------------------------------------------------
 
-    pub const KEY_TYPE: sp_core::crypto::KeyTypeId =
-        sp_core::crypto::KeyTypeId(*b"fast");
 
-    pub mod crypto {
-        use super::KEY_TYPE;
-        use sp_runtime::{
-            app_crypto::{app_crypto, sr25519},
-            MultiSignature, MultiSigner,
-        };
-        app_crypto!(sr25519, KEY_TYPE);
 
-        pub struct AuthId;
-
-        impl frame_system::offchain::AppCrypto<MultiSigner, MultiSignature>
-            for AuthId
-        {
-            type RuntimeAppPublic = Public;
-            type GenericSignature = sp_core::sr25519::Signature;
-            type GenericPublic = sp_core::sr25519::Public;
-        }
-    }
 
     // --------------------------------------------------------
     // Type aliases
@@ -934,5 +913,25 @@ if signer.can_sign() {
                 }
             }
         }
+    }
+}
+pub mod crypto {
+    use sp_runtime::{
+        app_crypto::{app_crypto, sr25519},
+        MultiSignature, MultiSigner,
+        KeyTypeId,
+    };
+
+    pub const KEY_TYPE: KeyTypeId = KeyTypeId(*b"fast");
+    app_crypto!(sr25519, KEY_TYPE);
+
+    pub struct FastlaneAuthId;
+
+    impl frame_system::offchain::AppCrypto<MultiSigner, MultiSignature>
+        for FastlaneAuthId
+    {
+        type RuntimeAppPublic = Public;
+        type GenericSignature = sp_core::sr25519::Signature;
+        type GenericPublic = sp_core::sr25519::Public;
     }
 }
