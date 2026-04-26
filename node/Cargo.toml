@@ -79,7 +79,9 @@ sp-timestamp.default-features = true
 sp-timestamp.workspace = true
 substrate-frame-rpc-system.default-features = true
 substrate-frame-rpc-system.workspace = true
+log = "0.4"
 parking_lot = "0.12.5"
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [build-dependencies]
 substrate-build-script-utils.default-features = true

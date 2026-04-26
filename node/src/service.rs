@@ -1,7 +1,7 @@
 //! Service and ServiceFactory implementation. Specialized wrapper over substrate service.
 
 use futures::FutureExt;
-use sc_client_api::{Backend, BlockBackend};
+use sc_client_api::{Backend, BlockBackend, BlockchainEvents};
 use sc_consensus_aura::{ImportQueueParams, SlotProportion, StartAuraParams};
 use sc_consensus_grandpa::SharedVoterState;
 use sc_service::{error::Error as ServiceError, Configuration, TaskManager, WarpSyncConfig};
@@ -9,6 +9,7 @@ use sc_telemetry::{Telemetry, TelemetryWorker};
 use sc_transaction_pool_api::OffchainTransactionPoolFactory;
 use solochain_template_runtime::{self, apis::RuntimeApi, opaque::Block};
 use sp_consensus_aura::sr25519::AuthorityPair as AuraPair;
+use sp_runtime::traits::Header as HeaderT;
 use std::{sync::Arc, time::Duration};
 
 pub(crate) type FullClient = sc_service::TFullClient<
@@ -211,6 +212,10 @@ pub fn new_full<
 	let enable_grandpa = !config.disable_grandpa;
 	let prometheus_registry = config.prometheus_registry().cloned();
 
+	// Capture the on-disk path for the SQLite database before `config` is consumed
+	// by `spawn_tasks`. The file lives alongside the rest of the chain data.
+	let db_path = config.base_path.path().join("node_data.db");
+
 	let rpc_extensions_builder = {
 		let client = client.clone();
 		let pool = transaction_pool.clone();
@@ -235,6 +240,77 @@ pub fn new_full<
 		config,
 		telemetry: telemetry.as_mut(),
 	})?;
+
+	// ── SQLite block indexer ───────────────────────────────────────────────────
+	// Open (or create) the database and subscribe to GRANDPA finality
+	// notifications.  Every finalized block is persisted with its extrinsics.
+	match crate::database::NodeDatabase::open(&db_path) {
+		Ok(node_db) => {
+			let db_client = client.clone();
+			let finality_stream = client.finality_notification_stream();
+
+			task_manager.spawn_handle().spawn(
+				"db-block-indexer",
+				None,
+				async move {
+					use futures::StreamExt;
+
+					let mut stream = finality_stream;
+					while let Some(notification) = stream.next().await {
+						let block_number = (*notification.header.number()) as u64;
+						let block_hash = format!("{:?}", notification.hash);
+						let parent_hash = format!("{:?}", notification.header.parent_hash());
+						let state_root = format!("{:?}", notification.header.state_root());
+
+						let extrinsics: Vec<String> = db_client
+							.block_body(notification.hash)
+							.ok()
+							.flatten()
+							.unwrap_or_default()
+							.iter()
+							.map(|ext| {
+								use sp_runtime::codec::Encode;
+								crate::database::bytes_to_hex(&ext.encode())
+							})
+							.collect();
+
+						let record = crate::database::BlockRecord::new(
+							block_number,
+							block_hash.clone(),
+							parent_hash,
+							state_root,
+							extrinsics,
+						);
+
+						match node_db.save_block(record) {
+							Ok(()) => log::info!(
+								target: "db-indexer",
+								"Persisted finalized block #{} ({}) to SQLite",
+								block_number,
+								block_hash,
+							),
+							Err(e) => log::error!(
+								target: "db-indexer",
+								"Failed to save block #{}: {:?}",
+								block_number,
+								e,
+							),
+						}
+					}
+				}
+				.boxed(),
+			);
+		},
+		Err(e) => {
+			log::warn!(
+				target: "db-indexer",
+				"Could not open SQLite node database at {:?}: {:?}. Block data will NOT be persisted.",
+				db_path,
+				e,
+			);
+		},
+	}
+	// ──────────────────────────────────────────────────────────────────────────
 
 	if role.is_authority() {
 		let proposer_factory = sc_basic_authorship::ProposerFactory::new(
