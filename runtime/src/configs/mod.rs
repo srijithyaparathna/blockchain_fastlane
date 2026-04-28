@@ -53,6 +53,7 @@ parameter_types! {
 	pub const Version: RuntimeVersion = VERSION;
 
 	pub AllowedDomains: Vec<u32> = Vec::new();
+	pub const MaxAutoFinalizePerBlock: u32 = 50;
 
 	/// We allow for 2 seconds of compute with a 6 second average block time.
 	pub RuntimeBlockWeights: BlockWeights = BlockWeights::with_sensible_defaults(
@@ -181,6 +182,8 @@ impl pallet_fastlane::Config for Runtime {
 
     // ✅ FIXED
     type AllowedDomains = AllowedDomains;
+    type OffchainChecks = ();
+    type MaxAutoFinalizePerBlock = MaxAutoFinalizePerBlock;
 
     type OnFinalised = ();
 }

@@ -189,7 +189,7 @@ pub type Executive = frame_executive::Executive<
 
 use codec::Encode;
 use sp_runtime::traits::StaticLookup;
-use frame_system::offchain::{AppCrypto, CreateSignedTransaction};
+use frame_system::offchain::{AppCrypto, CreateInherent, CreateSignedTransaction};
 
 
 
@@ -205,12 +205,18 @@ impl frame_system::offchain::CreateTransactionBase<pallet_fastlane::Call<Runtime
     for Runtime
 {
     type Extrinsic = UncheckedExtrinsic;
-    type RuntimeCall = RuntimeCall;
+    type RuntimeCall = pallet_fastlane::Call<Runtime>;
+}
+
+impl CreateInherent<pallet_fastlane::Call<Runtime>> for Runtime {
+    fn create_inherent(call: pallet_fastlane::Call<Runtime>) -> UncheckedExtrinsic {
+        UncheckedExtrinsic::new_bare(RuntimeCall::Fastlane(call))
+    }
 }
 
 impl CreateSignedTransaction<pallet_fastlane::Call<Runtime>> for Runtime {
     fn create_signed_transaction<C: AppCrypto<Self::Public, Self::Signature>>(
-        call: RuntimeCall,
+        call: pallet_fastlane::Call<Runtime>,
         public: Self::Public,
         account: AccountId,
         nonce: Nonce,
@@ -240,7 +246,8 @@ impl CreateSignedTransaction<pallet_fastlane::Call<Runtime>> for Runtime {
             frame_system::WeightReclaim::<Runtime>::new(),
         );
 
-        let raw_payload = SignedPayload::new(call, tx_ext).ok()?;
+        let runtime_call = RuntimeCall::Fastlane(call);
+        let raw_payload = SignedPayload::new(runtime_call, tx_ext).ok()?;
         let signature = raw_payload.using_encoded(|payload| C::sign(payload, public))?;
         let address = <Runtime as frame_system::Config>::Lookup::unlookup(account);
         let (call, tx_ext, _) = raw_payload.deconstruct();
