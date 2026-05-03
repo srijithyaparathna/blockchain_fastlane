@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build *)",
+      "Bash(grep -v \"^$\\\\|Checking\\\\|Compiling\\\\|warning: the following\\\\|wasm32\\\\|future-incompat\\\\|note:\\\\|help:\\\\|   |\\\\|-->\")",
+      "Bash(cargo check *)",
+      "Read(//home/srijith/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/frame-system-40.1.0/src/**)"
+    ]
+  }
+}

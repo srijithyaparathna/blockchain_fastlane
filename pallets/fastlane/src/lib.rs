@@ -35,8 +35,7 @@ pub mod pallet {
 
     use frame_system::{
         offchain::{
-            AppCrypto, CreateSignedTransaction,
-            SendUnsignedTransaction, SignedPayload, Signer, SigningTypes,
+            AppCrypto, CreateSignedTransaction, SubmitTransaction,
         },
         pallet_prelude::*,
     };
@@ -94,8 +93,10 @@ pub mod pallet {
             let allowed_domains = T::AllowedDomains::get();
             let domain_ok =
                 allowed_domains.is_empty() || allowed_domains.contains(&payload.domain);
+            // Accept the payload if the stored nonce has advanced past it,
+            // meaning submit() already validated and accepted the nonce.
             let nonce_ok =
-                Nonces::<T>::get(&payload.creator) == payload.nonce.saturating_add(1);
+                Nonces::<T>::get(&payload.creator) >= payload.nonce.saturating_add(1);
             let balance_ok = !T::Currency::free_balance(&payload.creator).is_zero();
             let kyc_ok = true;
             let rate_limit_ok = true;
@@ -351,31 +352,6 @@ pub mod pallet {
         pub checks_hash: [u8; 32],
     }
 
-    // --------------------------------------------------------
-    // AttestationPayload — signed payload submitted by the OCW.
-    //
-    // FIX: previously commented out entirely, leaving the OCW with no way to
-    // produce a cryptographically-signed unsigned transaction.  We now restore
-    // the struct and its SignedPayload impl so the Signer can wrap it
-    // correctly and validate_unsigned can verify the embedded public key.
-    // --------------------------------------------------------
-
-    #[derive(Encode, Decode, Clone, PartialEq, Eq, RuntimeDebug, TypeInfo)]
-    pub struct AttestationPayload<T: SigningTypes> {
-        pub payload_id: PayloadId,
-        /// SCALE-encoded AccountId of the authority whose key is signing.
-        pub authority_account: Vec<u8>,
-        /// Hash of deterministic validation checks run by the authority.
-        pub checks_hash: [u8; 32],
-        /// The OCW signer's public key (used by the SignedPayload trait).
-        pub public: T::Public,
-    }
-
-    impl<T: SigningTypes> SignedPayload<T> for AttestationPayload<T> {
-        fn public(&self) -> T::Public {
-            self.public.clone()
-        }
-    }
 
     // --------------------------------------------------------
     // Slash proof type
@@ -389,6 +365,30 @@ pub mod pallet {
         DoubleSigning(PayloadId, Vec<u8>, PayloadId, Vec<u8>),
         /// Authority submitted a signature that fails on-chain verification.
         InvalidSignature(PayloadId, Vec<u8>),
+    }
+
+    // --------------------------------------------------------
+    // Genesis config
+    // --------------------------------------------------------
+
+    #[pallet::genesis_config]
+    #[derive(frame_support::DefaultNoBound)]
+    pub struct GenesisConfig<T: Config> {
+        pub authorities: Vec<T::AccountId>,
+        pub threshold: u32,
+    }
+
+    #[pallet::genesis_build]
+    impl<T: Config> BuildGenesisConfig for GenesisConfig<T> {
+        fn build(&self) {
+            let bounded: BoundedVec<T::AccountId, T::MaxAuthorities> = self
+                .authorities
+                .clone()
+                .try_into()
+                .expect("Too many genesis authorities; increase MaxAuthorities");
+            Authorities::<T>::put(bounded);
+            Threshold::<T>::put(self.threshold);
+        }
     }
 
     // --------------------------------------------------------
@@ -424,11 +424,12 @@ pub mod pallet {
                 } else if status == Status::PreConsensed
                     && finalized < T::MaxAutoFinalizePerBlock::get()
                 {
-                    Statuses::<T>::insert(payload_id, Status::Finalised);
-                    Self::deposit_event(Event::Finalised { payload_id });
-                    let _ = T::OnFinalised::on_finalised(payload_id);
-                    finalized = finalized.saturating_add(1);
-                    weight = weight.saturating_add(T::DbWeight::get().writes(1));
+                    if T::OnFinalised::on_finalised(payload_id).is_ok() {
+                        Statuses::<T>::insert(payload_id, Status::Finalised);
+                        Self::deposit_event(Event::Finalised { payload_id });
+                        finalized = finalized.saturating_add(1);
+                        weight = weight.saturating_add(T::DbWeight::get().writes(1));
+                    }
                 }
             });
 
@@ -458,8 +459,7 @@ pub mod pallet {
         // --------------------------------------------------------
         fn offchain_worker(block_number: BlockNumberFor<T>) {
             // Avoid re-processing the same block on restart.
-            let store =
-                StorageValueRef::persistent(b"fastlane::last_ocw_block");
+            let store = StorageValueRef::persistent(b"fastlane::last_ocw_block");
             if let Ok(Some(last)) = store.get::<BlockNumberFor<T>>() {
                 if last >= block_number {
                     return;
@@ -467,8 +467,10 @@ pub mod pallet {
             }
             store.set(&block_number);
 
-            let signer = Signer::<T, T::AuthorityId>::all_accounts();
-            if !signer.can_sign() {
+            // Enumerate local sr25519 keys registered under the "fast" key type.
+            let local_keys =
+                sp_io::crypto::sr25519_public_keys(crate::crypto::KEY_TYPE);
+            if local_keys.is_empty() {
                 return;
             }
 
@@ -484,7 +486,7 @@ pub mod pallet {
 
                 let checks_hash =
                     match T::OffchainChecks::compute_checks_hash(&payload) {
-                        Some(hash) => hash,
+                        Some(h) => h,
                         None => continue,
                     };
 
@@ -493,20 +495,49 @@ pub mod pallet {
                     continue;
                 }
 
-                let _ = signer.send_unsigned_transaction(
-                    |acct| AttestationPayload::<T> {
-                        payload_id,
-                        authority_account: acct.id.encode(),
-                        checks_hash,
-                        public: acct.public.clone(),
-                    },
-                    |payload, signature| Call::attest_unsigned {
-                        payload_id: payload.payload_id,
-                        authority_encoded: payload.authority_account,
-                        signature: signature.encode(),
-                        checks_hash: payload.checks_hash,
-                    },
-                );
+                // Canonical message — same bytes verified by do_attest.
+                let mut msg = payload_id.to_vec();
+                msg.extend_from_slice(&payload.expiry.encode());
+                msg.extend_from_slice(&checks_hash);
+                let msg_hash: [u8; 32] = sp_io::hashing::blake2_256(&msg);
+
+                for key_pub in &local_keys {
+                    // In sr25519 runtimes the AccountId IS the raw public key.
+                    let auth = match T::AccountId::decode(
+                        &mut key_pub.0.as_ref(),
+                    ) {
+                        Ok(a) => a,
+                        Err(_) => continue,
+                    };
+
+                    if !authorities.contains(&auth) {
+                        continue;
+                    }
+
+                    // Skip if we already attested this payload.
+                    if Attestations::<T>::get(payload_id)
+                        .iter()
+                        .any(|r| r.authority == auth)
+                    {
+                        continue;
+                    }
+
+                    if let Some(raw_sig) = sp_io::crypto::sr25519_sign(
+                        crate::crypto::KEY_TYPE,
+                        key_pub,
+                        &msg_hash,
+                    ) {
+                        let call = Call::attest_unsigned {
+                            payload_id,
+                            authority_encoded: auth.encode(),
+                            // 64-byte raw sig — handled by do_attest's len==64 branch.
+                            signature: raw_sig.0.to_vec(),
+                            checks_hash,
+                        };
+                        let xt = T::create_inherent(call.into());
+                        let _ = SubmitTransaction::<T, Call<T>>::submit_transaction(xt);
+                    }
+                }
             }
         }
     }
@@ -664,7 +695,8 @@ pub mod pallet {
             signature: Vec<u8>,
             checks_hash: [u8; 32],
         ) -> DispatchResult {
-            ensure_signed(origin)?;
+            let who = ensure_signed(origin)?;
+            ensure!(who == authority, Error::<T>::NotAuthority);
             Self::do_attest(payload_id, authority, signature, checks_hash)
         }
 
@@ -685,11 +717,6 @@ pub mod pallet {
             payload_id: PayloadId,
         ) -> DispatchResult {
             let _ = ensure_signed(origin)?;
-
-            ensure!(
-                Payloads::<T>::contains_key(payload_id),
-                Error::<T>::PayloadNotFound
-            );
 
             let status = Statuses::<T>::get(payload_id)
                 .ok_or(Error::<T>::PayloadNotFound)?;
@@ -875,7 +902,12 @@ pub mod pallet {
 
             let status = Statuses::<T>::get(payload_id)
                 .ok_or(Error::<T>::PayloadNotFound)?;
-            ensure!(status == Status::Submitted, Error::<T>::AlreadyPreConsensed);
+            match status {
+                Status::Submitted    => { /* proceed */ }
+                Status::PreConsensed => return Err(Error::<T>::AlreadyPreConsensed.into()),
+                Status::Finalised    => return Err(Error::<T>::AlreadyFinalised.into()),
+                Status::Expired      => return Err(Error::<T>::PayloadExpired.into()),
+            }
 
             let authorities = Authorities::<T>::get();
             ensure!(authorities.contains(&authority), Error::<T>::NotAuthority);

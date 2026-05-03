@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{AccountId, BalancesConfig, RuntimeGenesisConfig, SudoConfig};
+use crate::{AccountId, BalancesConfig, FastlaneConfig, RuntimeGenesisConfig, SudoConfig};
 use alloc::{vec, vec::Vec};
 use frame_support::build_struct_json_patch;
 use serde_json::Value;
@@ -29,6 +29,8 @@ fn testnet_genesis(
 	initial_authorities: Vec<(AuraId, GrandpaId)>,
 	endowed_accounts: Vec<AccountId>,
 	root: AccountId,
+	fastlane_authorities: Vec<AccountId>,
+	fastlane_threshold: u32,
 ) -> Value {
 	build_struct_json_patch!(RuntimeGenesisConfig {
 		balances: BalancesConfig {
@@ -45,6 +47,11 @@ fn testnet_genesis(
 			authorities: initial_authorities.iter().map(|x| (x.1.clone(), 1)).collect::<Vec<_>>(),
 		},
 		sudo: SudoConfig { key: Some(root) },
+		fastlane: FastlaneConfig {
+			authorities: fastlane_authorities,
+			threshold: fastlane_threshold,
+			..Default::default()
+		},
 	})
 }
 
@@ -62,6 +69,8 @@ pub fn development_config_genesis() -> Value {
 			Sr25519Keyring::BobStash.to_account_id(),
 		],
 		sp_keyring::Sr25519Keyring::Alice.to_account_id(),
+		vec![Sr25519Keyring::Alice.to_account_id()],
+		1,
 	)
 }
 
@@ -83,6 +92,11 @@ pub fn local_config_genesis() -> Value {
 			.map(|v| v.to_account_id())
 			.collect::<Vec<_>>(),
 		Sr25519Keyring::Alice.to_account_id(),
+		vec![
+			Sr25519Keyring::Alice.to_account_id(),
+			Sr25519Keyring::Bob.to_account_id(),
+		],
+		2,
 	)
 }
 
