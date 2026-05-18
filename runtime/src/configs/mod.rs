@@ -54,6 +54,7 @@ parameter_types! {
 
 	pub AllowedDomains: Vec<u32> = Vec::new();
 	pub const MaxAutoFinalizePerBlock: u32 = 50;
+	pub const MaxExpiriesPerBlock: u32 = 50;
 
 	/// We allow for 2 seconds of compute with a 6 second average block time.
 	pub RuntimeBlockWeights: BlockWeights = BlockWeights::with_sensible_defaults(
@@ -184,6 +185,8 @@ impl pallet_fastlane::Config for Runtime {
     type AllowedDomains = AllowedDomains;
     type OffchainChecks = ();
     type MaxAutoFinalizePerBlock = MaxAutoFinalizePerBlock;
+    type MaxExpiriesPerBlock = MaxExpiriesPerBlock;
+    type WeightInfo = pallet_fastlane::weights::SubstrateWeight<Runtime>;
 
     type OnFinalised = ();
 }

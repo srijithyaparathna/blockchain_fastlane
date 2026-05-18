@@ -6,9 +6,14 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 pub use crate::pallet::*;
+pub use crate::weights::WeightInfo;
 
+pub mod weights;
 
-
+#[cfg(test)]
+mod mock;
+#[cfg(test)]
+mod tests;
 
 
 #[frame_support::pallet]
@@ -51,6 +56,8 @@ pub mod pallet {
     };
 
     use sp_std::vec::Vec;
+
+    use crate::weights::WeightInfo;
 
     // --------------------------------------------------------
 
@@ -186,6 +193,11 @@ pub mod pallet {
         type OffchainChecks: OffchainChecks<Self>;
         /// Maximum number of PreConsensed payloads auto-finalized in one block.
         type MaxAutoFinalizePerBlock: Get<u32>;
+        /// Maximum number of payloads expired in one block. Bounds the work
+        /// performed in `on_initialize` so the chain cannot stall under load.
+        type MaxExpiriesPerBlock: Get<u32>;
+        /// Benchmarked weights.
+        type WeightInfo: crate::weights::WeightInfo;
     }
 
     // --------------------------------------------------------
@@ -260,6 +272,27 @@ pub mod pallet {
     #[pallet::getter(fn pending_count)]
     pub type PendingCount<T: Config> = StorageValue<_, u32, ValueQuery>;
 
+    /// Per-block expiry index. When the chain reaches block `expiry + 1`,
+    /// `on_initialize` drains `ExpiryAt[expiry + 1]` and marks any still-
+    /// Submitted payloads as Expired. Eliminates the O(n) full-storage scan.
+    #[pallet::storage]
+    pub type ExpiryAt<T: Config> = StorageMap<
+        _,
+        Twox64Concat,
+        BlockNumberFor<T>,
+        BoundedVec<PayloadId, T::MaxPendingPayloads>,
+        ValueQuery,
+    >;
+
+    /// FIFO queue of payloads in PreConsensed state awaiting auto-finalisation.
+    /// Drained `MaxAutoFinalizePerBlock` items per block in `on_initialize`.
+    #[pallet::storage]
+    pub type PreConsensedQueue<T: Config> = StorageValue<
+        _,
+        BoundedVec<PayloadId, T::MaxPendingPayloads>,
+        ValueQuery,
+    >;
+
     // --------------------------------------------------------
     // Events
     // --------------------------------------------------------
@@ -283,6 +316,10 @@ pub mod pallet {
         AuthoritySlashed { authority: T::AccountId, amount: BalanceOf<T> },
         /// An authority posted its bond.
         BondPosted { authority: T::AccountId, amount: BalanceOf<T> },
+        /// An authority was evicted from the active set because their bond fell
+        /// below `MinAuthorityBond` (typically after a slash). The chain may
+        /// require governance intervention if the threshold is now unreachable.
+        AuthorityEvicted { authority: T::AccountId },
     }
 
     // --------------------------------------------------------
@@ -386,6 +423,20 @@ pub mod pallet {
                 .clone()
                 .try_into()
                 .expect("Too many genesis authorities; increase MaxAuthorities");
+
+            // Reserve MinAuthorityBond for each genesis authority so that:
+            // (a) they are immediately slash-able from block 1, and
+            // (b) subsequent set_authorities calls that include them succeed
+            //     (set_authorities checks bonded >= MinAuthorityBond).
+            let min_bond = T::MinAuthorityBond::get();
+            if !min_bond.is_zero() {
+                for authority in &self.authorities {
+                    if T::Currency::reserve(authority, min_bond).is_ok() {
+                        AuthorityBonds::<T>::insert(authority, min_bond);
+                    }
+                }
+            }
+
             Authorities::<T>::put(bounded);
             Threshold::<T>::put(self.threshold);
         }
@@ -398,42 +449,60 @@ pub mod pallet {
     #[pallet::hooks]
     impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
 
-        /// Expire stale Submitted payloads at the start of every block.
+        /// Process expirations and auto-finalisations at the start of every
+        /// block. Both queues are bounded, so the work is O(constant) regardless
+        /// of how many historical payloads exist.
         fn on_initialize(now: BlockNumberFor<T>) -> Weight {
-            let mut weight = Weight::zero();
-            let mut finalized: u32 = 0;
+            // Drain payloads scheduled to expire at this block.
+            let max_expiries = T::MaxExpiriesPerBlock::get() as usize;
+            let mut expired_count: u32 = 0;
+            let scheduled = ExpiryAt::<T>::take(now);
+            let mut leftovers: Vec<PayloadId> = Vec::new();
 
-            Statuses::<T>::iter().for_each(|(payload_id, status)| {
-                weight = weight.saturating_add(T::DbWeight::get().reads(1));
+            for (idx, payload_id) in scheduled.into_iter().enumerate() {
+                if idx >= max_expiries {
+                    leftovers.push(payload_id);
+                    continue;
+                }
+                if matches!(Statuses::<T>::get(payload_id), Some(Status::Submitted)) {
+                    Statuses::<T>::insert(payload_id, Status::Expired);
+                    PendingCount::<T>::mutate(|c| *c = c.saturating_sub(1));
+                    Self::deposit_event(Event::Expired { payload_id });
+                    expired_count = expired_count.saturating_add(1);
+                }
+            }
 
-                if status == Status::Submitted {
-                    if let Some(payload) = Payloads::<T>::get(payload_id) {
-                        weight = weight.saturating_add(T::DbWeight::get().reads(1));
-
-                        if now > payload.expiry {
-                            Statuses::<T>::insert(payload_id, Status::Expired);
-                            PendingCount::<T>::mutate(|c| {
-                                *c = c.saturating_sub(1);
-                            });
-                            Self::deposit_event(Event::Expired { payload_id });
-                            weight = weight.saturating_add(
-                                T::DbWeight::get().writes(2),
-                            );
+            // Reschedule leftovers to the next block. Bounded extend is best-
+            // effort: if the next block's queue is already full the surplus is
+            // dropped silently, which can only happen under deliberate flooding.
+            if !leftovers.is_empty() {
+                let next_block = now.saturating_add(1u32.into());
+                ExpiryAt::<T>::mutate(next_block, |q| {
+                    for id in leftovers {
+                        if q.try_push(id).is_err() {
+                            break;
                         }
                     }
-                } else if status == Status::PreConsensed
-                    && finalized < T::MaxAutoFinalizePerBlock::get()
-                {
+                });
+            }
+
+            // Drain auto-finalisations from the PreConsensed queue.
+            let max_finalize = T::MaxAutoFinalizePerBlock::get() as usize;
+            let mut finalized_count: u32 = 0;
+            PreConsensedQueue::<T>::mutate(|queue| {
+                let take = max_finalize.min(queue.len());
+                for _ in 0..take {
+                    let payload_id = queue.remove(0);
                     if T::OnFinalised::on_finalised(payload_id).is_ok() {
                         Statuses::<T>::insert(payload_id, Status::Finalised);
                         Self::deposit_event(Event::Finalised { payload_id });
-                        finalized = finalized.saturating_add(1);
-                        weight = weight.saturating_add(T::DbWeight::get().writes(1));
+                        finalized_count = finalized_count.saturating_add(1);
                     }
                 }
             });
 
-            weight
+            T::WeightInfo::on_initialize_expire(expired_count)
+                .saturating_add(T::WeightInfo::on_initialize_finalize(finalized_count))
         }
 
         // --------------------------------------------------------
@@ -627,7 +696,7 @@ pub mod pallet {
         // submit(nonce, expiry, domain, payload_hash)
         // ----------------------------------------------------
         #[pallet::call_index(0)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::submit())]
         pub fn submit(
             origin: OriginFor<T>,
             nonce: u64,
@@ -665,6 +734,16 @@ pub mod pallet {
                 Error::<T>::DuplicatePayload
             );
 
+            // Schedule expiry check at block `expiry + 1` (the first block at
+            // which `now > expiry`). Reserve queue slot before mutating any
+            // other storage so we fail cleanly if the queue is full.
+            let expire_at = expiry.saturating_add(1u32.into());
+            ExpiryAt::<T>::try_mutate(expire_at, |q| -> DispatchResult {
+                q.try_push(payload_id)
+                    .map_err(|_| Error::<T>::TooManyPendingPayloads)?;
+                Ok(())
+            })?;
+
             let payload = Payload::<T> {
                 creator: who.clone(),
                 created_at: now,
@@ -687,7 +766,7 @@ pub mod pallet {
         // attest — signed variant for manual / test use
         // ----------------------------------------------------
         #[pallet::call_index(1)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::attest())]
         pub fn attest(
             origin: OriginFor<T>,
             payload_id: PayloadId,
@@ -702,16 +781,9 @@ pub mod pallet {
 
         // ----------------------------------------------------
         // finalize — callable by anyone once PreConsensed.
-        //
-        // FIX: the original did not decrement PendingCount when a payload
-        // moved from PreConsensed → Finalised.  PendingCount is decremented
-        // in do_attest when the payload reaches PreConsensed, so that part
-        // was already handled there.  However, documenting clearly: no
-        // further decrement is needed here because PendingCount only tracks
-        // the Submitted state.
         // ----------------------------------------------------
         #[pallet::call_index(2)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::finalize())]
         pub fn finalize(
             origin: OriginFor<T>,
             payload_id: PayloadId,
@@ -728,6 +800,13 @@ pub mod pallet {
                 Status::PreConsensed => { /* proceed */ }
             }
 
+            // Remove from PreConsensedQueue so on_initialize doesn't re-finalise.
+            PreConsensedQueue::<T>::mutate(|q| {
+                if let Some(pos) = q.iter().position(|id| id == &payload_id) {
+                    q.remove(pos);
+                }
+            });
+
             Statuses::<T>::insert(payload_id, Status::Finalised);
             Self::deposit_event(Event::Finalised { payload_id });
             T::OnFinalised::on_finalised(payload_id)?;
@@ -739,7 +818,7 @@ pub mod pallet {
         // set_authorities — root only
         // ----------------------------------------------------
         #[pallet::call_index(3)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::set_authorities(new_authorities.len() as u32))]
         pub fn set_authorities(
             origin: OriginFor<T>,
             new_authorities: BoundedVec<T::AccountId, T::MaxAuthorities>,
@@ -759,14 +838,9 @@ pub mod pallet {
 
         // ----------------------------------------------------
         // set_threshold — root only.
-        //
-        // FIX: the original only checked value > authority_count / 2 but
-        // never checked value <= authority_count.  A threshold larger than
-        // the authority set can never be reached, permanently locking all
-        // payloads.  We now also guard against that.
         // ----------------------------------------------------
         #[pallet::call_index(4)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::set_threshold())]
         pub fn set_threshold(
             origin: OriginFor<T>,
             value: u32,
@@ -781,7 +855,7 @@ pub mod pallet {
                 Error::<T>::ThresholdTooLow
             );
 
-            // FIX: must not exceed the authority set size.
+            // Must not exceed the authority set size.
             ensure!(
                 value <= authority_count,
                 Error::<T>::ThresholdTooHigh
@@ -796,7 +870,7 @@ pub mod pallet {
         // attest_unsigned — unsigned variant submitted by the OCW
         // ----------------------------------------------------
         #[pallet::call_index(5)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::attest_unsigned())]
         pub fn attest_unsigned(
             origin: OriginFor<T>,
             payload_id: PayloadId,
@@ -816,7 +890,7 @@ pub mod pallet {
         // post_bond — reserve funds as authority bond
         // ----------------------------------------------------
         #[pallet::call_index(6)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::post_bond())]
         pub fn post_bond(
             origin: OriginFor<T>,
             amount: BalanceOf<T>,
@@ -839,16 +913,13 @@ pub mod pallet {
         // ----------------------------------------------------
         // slash — root only governance slash.
         //
-        // FIX: the original called Currency::unreserve then Currency::slash,
-        // which first frees the reserved funds back to the free balance and
-        // then destroys them from the free balance.  The correct pattern for
-        // slashing *reserved* funds is Currency::slash_reserved, which burns
-        // directly from the reserved balance without ever releasing them.
-        // Using unreserve+slash creates a race window where the funds are
-        // briefly accessible as free balance.
+        // Uses Currency::slash_reserved (burns directly from reserved balance,
+        // no transient free-balance window). After slashing, if the remaining
+        // bond falls below MinAuthorityBond the authority is auto-evicted from
+        // the active set so it cannot continue producing attestations.
         // ----------------------------------------------------
         #[pallet::call_index(7)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::slash())]
         pub fn slash(
             origin: OriginFor<T>,
             authority: T::AccountId,
@@ -867,16 +938,31 @@ pub mod pallet {
 
             Self::validate_slash_proof(&authority, &proof)?;
 
-            // FIX: slash_reserved burns directly from reserved balance —
-            // no temporary free-balance window.
             let (_imbalance, _unslashed) =
                 T::Currency::slash_reserved(&authority, amount);
 
-            AuthorityBonds::<T>::mutate(&authority, |b| {
-                *b = (*b).saturating_sub(amount);
+            let new_bond = bonded.saturating_sub(amount);
+            AuthorityBonds::<T>::insert(&authority, new_bond);
+
+            Self::deposit_event(Event::AuthoritySlashed {
+                authority: authority.clone(),
+                amount,
             });
 
-            Self::deposit_event(Event::AuthoritySlashed { authority, amount });
+            // Auto-evict if the remaining bond is insufficient. The chain may
+            // now have fewer authorities than the threshold; downstream payloads
+            // will stall until governance calls set_authorities or set_threshold.
+            if new_bond < T::MinAuthorityBond::get() {
+                let evicted = Authorities::<T>::mutate(|authorities| {
+                    let before = authorities.len();
+                    authorities.retain(|a| a != &authority);
+                    before != authorities.len()
+                });
+                if evicted {
+                    Self::deposit_event(Event::AuthorityEvicted { authority });
+                }
+            }
+
             Ok(())
         }
     }
@@ -966,9 +1052,14 @@ pub mod pallet {
             Attestations::<T>::insert(payload_id, sigs.clone());
 
             let threshold = Threshold::<T>::get();
-            if sigs.len() as u32 >= threshold {
+            if threshold > 0 && sigs.len() as u32 >= threshold {
                 Statuses::<T>::insert(payload_id, Status::PreConsensed);
                 PendingCount::<T>::mutate(|c| *c = c.saturating_sub(1));
+                // Best-effort push; if the queue is full the payload still
+                // becomes PreConsensed and can be finalised manually via the
+                // finalize() extrinsic. The bound matches MaxPendingPayloads
+                // so this can only happen under simultaneous burst load.
+                let _ = PreConsensedQueue::<T>::mutate(|q| q.try_push(payload_id));
                 Self::deposit_event(Event::PreConsensed { payload_id });
             }
 

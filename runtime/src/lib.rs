@@ -205,18 +205,23 @@ impl frame_system::offchain::CreateTransactionBase<pallet_fastlane::Call<Runtime
     for Runtime
 {
     type Extrinsic = UncheckedExtrinsic;
-    type RuntimeCall = pallet_fastlane::Call<Runtime>;
+    // RuntimeCall must be the outer enum so that From<pallet_fastlane::Call<Runtime>>
+    // routes through RuntimeCall::Fastlane(call), which is what the pool and
+    // validate_unsigned both decode.
+    type RuntimeCall = RuntimeCall;
 }
 
 impl CreateInherent<pallet_fastlane::Call<Runtime>> for Runtime {
-    fn create_inherent(call: pallet_fastlane::Call<Runtime>) -> UncheckedExtrinsic {
-        UncheckedExtrinsic::new_bare(RuntimeCall::Fastlane(call))
+    // `call` is already the outer RuntimeCall (wrapped by the pallet's `call.into()`
+    // via RuntimeCall::from(pallet_call) = RuntimeCall::Fastlane(pallet_call)).
+    fn create_inherent(call: RuntimeCall) -> UncheckedExtrinsic {
+        UncheckedExtrinsic::new_bare(call)
     }
 }
 
 impl CreateSignedTransaction<pallet_fastlane::Call<Runtime>> for Runtime {
     fn create_signed_transaction<C: AppCrypto<Self::Public, Self::Signature>>(
-        call: pallet_fastlane::Call<Runtime>,
+        call: RuntimeCall,
         public: Self::Public,
         account: AccountId,
         nonce: Nonce,
@@ -246,8 +251,7 @@ impl CreateSignedTransaction<pallet_fastlane::Call<Runtime>> for Runtime {
             frame_system::WeightReclaim::<Runtime>::new(),
         );
 
-        let runtime_call = RuntimeCall::Fastlane(call);
-        let raw_payload = SignedPayload::new(runtime_call, tx_ext).ok()?;
+        let raw_payload = SignedPayload::new(call, tx_ext).ok()?;
         let signature = raw_payload.using_encoded(|payload| C::sign(payload, public))?;
         let address = <Runtime as frame_system::Config>::Lookup::unlookup(account);
         let (call, tx_ext, _) = raw_payload.deconstruct();

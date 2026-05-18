@@ -4,7 +4,19 @@
       "Bash(cargo build *)",
       "Bash(grep -v \"^$\\\\|Checking\\\\|Compiling\\\\|warning: the following\\\\|wasm32\\\\|future-incompat\\\\|note:\\\\|help:\\\\|   |\\\\|-->\")",
       "Bash(cargo check *)",
-      "Read(//home/srijith/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/frame-system-40.1.0/src/**)"
+      "Read(//home/srijith/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/frame-system-40.1.0/src/**)",
+      "Bash(cargo test *)",
+      "Bash(chmod +x /home/srijith/my-blockchain/scripts/*.sh)",
+      "Bash(timeout 25 ./scripts/run-dev.sh)",
+      "Bash(timeout 30 ./scripts/run-dev.sh)",
+      "Bash(./target/release/solochain-template-node --help)",
+      "Bash(./target/release/solochain-template-node key *)",
+      "Bash(./scripts/setup-keys.sh ./data/dev dev //Alice)",
+      "Bash(curl -s -X POST -H \"Content-Type: application/json\" --data '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"system_health\",\"params\":[]}' http://localhost:9944)",
+      "Read(//home/srijith/fastlane-frontend/**)"
+    ],
+    "additionalDirectories": [
+      "/home/srijith/fastlane-frontend/src/lib"
     ]
   }
 }
